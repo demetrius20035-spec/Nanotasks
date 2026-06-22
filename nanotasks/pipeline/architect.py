@@ -6,10 +6,8 @@
 
 from __future__ import annotations
 
-import yaml
-
 from ..llm import LLMClient
-from .coder import strip_code_fences
+from ..textutil import load_yaml_lenient
 
 ARCHITECT_SYSTEM = (
     "Ты — системный архитектор. По краткому брифу составь полный план разработки и "
@@ -35,15 +33,21 @@ ARCHITECT_SYSTEM = (
 
 
 def parse_plan(raw: str) -> dict:
-    data = yaml.safe_load(strip_code_fences(raw))
-    if not isinstance(data, dict) or "project" not in data or "tasks" not in data:
+    data = load_yaml_lenient(raw)
+    if "project" not in data or "tasks" not in data:
         raise ValueError(
             "Архитектор вернул не план Nanotasks (нет project/tasks):\n" + raw[:500]
         )
     return data
 
 
-def run_architect(client: LLMClient, brief: str, language: str | None = None) -> dict:
+def run_architect(client: LLMClient, brief: str, language: str | None = None,
+                  retries: int = 1) -> dict:
     user = brief if not language else f"Целевой язык: {language}\n\nБриф:\n{brief}"
-    raw = client.ask(ARCHITECT_SYSTEM, user)
-    return parse_plan(raw)
+    last: Exception | None = None
+    for _ in range(retries + 1):
+        try:
+            return parse_plan(client.ask(ARCHITECT_SYSTEM, user))
+        except ValueError as exc:
+            last = exc
+    raise last  # type: ignore[misc]

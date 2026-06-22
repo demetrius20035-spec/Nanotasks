@@ -11,16 +11,13 @@
 from __future__ import annotations
 
 import itertools
-
-import yaml
-
 from collections import deque
 
 from ..db import Repository
 from ..llm import LLMClient
 from ..models import DONE_STATES, Task, TaskStatus, TaskType
+from ..textutil import load_yaml_lenient
 from .assembler import render_tree
-from .coder import strip_code_fences
 
 AUDITOR_SYSTEM = (
     "Ты — ведущий архитектор и ревьюер кода. Тебе дают ТЗ/ФС, текущий код проекта "
@@ -61,9 +58,7 @@ def build_audit_input(repo: Repository, project_id: int, errors: str | None = No
 
 
 def parse_audit(raw: str) -> dict:
-    data = yaml.safe_load(strip_code_fences(raw))
-    if not isinstance(data, dict):
-        raise ValueError(f"Аудитор вернул не YAML-словарь:\n{raw[:500]}")
+    data = load_yaml_lenient(raw)
     data.setdefault("audit", "")
     data.setdefault("fixes", [])
     data.setdefault("additions", [])
@@ -71,9 +66,15 @@ def parse_audit(raw: str) -> dict:
 
 
 def run_audit(client: LLMClient, repo: Repository, project_id: int,
-              errors: str | None = None) -> dict:
-    raw = client.ask(AUDITOR_SYSTEM, build_audit_input(repo, project_id, errors))
-    return parse_audit(raw)
+              errors: str | None = None, retries: int = 1) -> dict:
+    user = build_audit_input(repo, project_id, errors)
+    last: Exception | None = None
+    for _ in range(retries + 1):
+        try:
+            return parse_audit(client.ask(AUDITOR_SYSTEM, user))
+        except ValueError as exc:
+            last = exc
+    raise last  # type: ignore[misc]
 
 
 def apply_audit(repo: Repository, project_id: int, parsed: dict, audit_id: int,

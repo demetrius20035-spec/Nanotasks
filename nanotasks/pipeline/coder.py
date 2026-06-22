@@ -6,26 +6,15 @@
 
 from __future__ import annotations
 
-import re
-
 from ..llm import LLMClient
+from ..textutil import strip_code_fences
 
 CODER_SYSTEM = (
     "Ты пишешь код строго по заданию. Выведи ТОЛЬКО итоговое содержимое файла — "
     "без пояснений и без markdown-ограждений."
 )
 
-_FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
-
-
-def strip_code_fences(text: str) -> str:
-    """Убирает markdown-ограждения, если модель всё-таки их добавила."""
-    text = text.strip()
-    blocks = _FENCE_RE.findall(text)
-    if blocks:
-        # берём самый длинный фрагмент кода
-        return max(blocks, key=len).strip("\n")
-    return text
+__all__ = ["CODER_SYSTEM", "generate_code", "strip_code_fences"]
 
 
 def generate_code(client: LLMClient, nano_prompt: str) -> str:

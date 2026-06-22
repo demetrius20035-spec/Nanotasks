@@ -51,15 +51,15 @@ class Orchestrator:
         current = self.repo.latest_artifact(task.id)
         current_code = current.content if (current is not None and feedback) else None
 
-        nano = build_nano_prompt(
+        nano = self._retry(lambda: build_nano_prompt(
             self.prompt_client, task, context, language, current_code, feedback
-        )
+        ))
         prompt_id = self.repo.save_prompt(
             task.id, "prompt_builder", nano, self.prompt_client.model
         )
         self.repo.update_task_status(task.id, TaskStatus.PROMPT_READY)
 
-        code = generate_code(self.coder_client, nano)
+        code = self._retry(lambda: generate_code(self.coder_client, nano))
         self.repo.save_artifact(
             task.id, code, prompt_id, self.coder_client.model, task.file_path
         )
@@ -77,6 +77,16 @@ class Orchestrator:
         # одобрение закрывает все замечания: они учтены в принятой версии
         self.repo.resolve_feedback(task.id)
         self.repo.update_task_status(task.id, TaskStatus.APPROVED)
+
+    def _retry(self, fn):
+        """Повторяет вызов модели при временной ошибке (config.max_retries)."""
+        last: LLMError | None = None
+        for _ in range(max(1, self.config.max_retries + 1)):
+            try:
+                return fn()
+            except LLMError as exc:
+                last = exc
+        raise last  # type: ignore[misc]
 
     # ── волна аудита большой моделью ──────────────────────────────────────────
     def audit_round(self, project_id: int, auditor_client,
