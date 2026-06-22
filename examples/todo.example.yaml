@@ -1,0 +1,61 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Пример TODO, который выдаёт модель-АРХИТЕКТОР — сразу в формате, готовом к
+# импорту в базу. Иерархия: пункт → подпункт → подподпункт (через `children`).
+#
+# Импорт:  python -m nanotasks.cli import examples/todo.example.yaml
+#
+# Поля задачи:
+#   key        — номер пункта (1, 1.1, 1.1.2 ...). Удобно для человека.
+#   title      — короткое название.
+#   type       — group | code | yaml | config | doc | test
+#                  group  = просто узел-раздел, код не генерируется;
+#                  всё остальное — лист, для него будет промпт и артефакт.
+#   file       — путь файла в собираемом проекте (для листьев).
+#   body       — текстовый блок пункта из TODO архитектора (что нужно сделать).
+#   depends_on — ключи других задач, чьи КОНТРАКТЫ нужно подмешать в контекст.
+#                Это и есть «сборка контекста» — без неё stateless-кодер
+#                выдумает сигнатуры и файлы не склеятся.
+#   children   — вложенные подпункты.
+# ─────────────────────────────────────────────────────────────────────────────
+
+project:
+  name: "Todo CLI"
+  description: "Маленькое CLI-приложение списка дел на Python (демо-проект)."
+  language: python
+
+tasks:
+  - key: "1"
+    title: "Модель данных"
+    type: group
+    children:
+      - key: "1.1"
+        title: "Класс Task"
+        type: code
+        file: "todoapp/models.py"
+        body: >
+          Определи dataclass `Task` с полями:
+          id: int, title: str, done: bool = False.
+          Добавь метод `toggle()`, который инвертирует поле done.
+
+  - key: "2"
+    title: "Хранилище"
+    type: group
+    children:
+      - key: "2.1"
+        title: "JSON-хранилище задач"
+        type: code
+        file: "todoapp/storage.py"
+        depends_on: ["1.1"]
+        body: >
+          Класс `Storage(path: str)` с методами:
+          load() -> list[Task] и save(tasks: list[Task]) -> None.
+          Сериализация в JSON-файл по пути path. Используй класс Task из модели данных.
+
+  - key: "3"
+    title: "Точка входа CLI"
+    type: code
+    file: "todoapp/__main__.py"
+    depends_on: ["1.1", "2.1"]
+    body: >
+      CLI на argparse с командами: add <title>, list, done <id>.
+      Используй Storage для загрузки/сохранения и Task как модель.

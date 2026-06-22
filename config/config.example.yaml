@@ -1,0 +1,58 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Nanotasks — пример конфигурации.
+# Скопируй в config/config.yaml и поправь под себя.
+#   cp config/config.example.yaml config/config.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Встроенная СУБД (DuckDB). Один файл, сервер не нужен.
+database:
+  path: data/nanotasks.duckdb
+
+# Куда оркестратор собирает дерево файлов готового проекта.
+output:
+  dir: output
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Роли моделей. Каждая роль — отдельный клиент со своим endpoint и моделью.
+# Локальные модели Ollama/LM Studio говорят по OpenAI-совместимому протоколу.
+#   Ollama:    base_url: http://localhost:11434/v1
+#   LM Studio: base_url: http://localhost:1234/v1
+# ─────────────────────────────────────────────────────────────────────────────
+models:
+
+  # АРХИТЕКТОР — большая внешняя модель. Делает ТЗ+ФС+TODO.
+  # Пока не вызывается оркестратором (TODO импортируем вручную),
+  # но место под API уже зарезервировано. Провайдеры: openai_compatible | alice | gigachat.
+  architect:
+    provider: openai_compatible
+    base_url: http://localhost:11434/v1
+    model: qwen2.5:32b
+    api_key: null
+    temperature: 0.3
+    timeout: 600
+
+  # ПРОМПТ-МЕЙКЕР — локальная модель. Из пункта TODO делает точный нано-промпт.
+  prompt_builder:
+    provider: openai_compatible
+    base_url: http://localhost:11434/v1
+    model: gemma2:27b
+    api_key: null
+    temperature: 0.2
+    timeout: 600
+
+  # КОДЕР — локальная модель. Из нано-промпта делает код/артефакт.
+  coder:
+    provider: openai_compatible
+    base_url: http://localhost:11434/v1
+    model: qwen2.5-coder:14b
+    api_key: null
+    temperature: 0.1
+    timeout: 600
+
+# Поведение цикла исполнения.
+run:
+  # auto  — гнать пункты подряд без остановки;
+  # review — останавливаться на каждом сгенерированном артефакте для ревью человеком.
+  mode: review
+  # Сколько раз пытаться перегенерировать пункт при ошибке модели.
+  max_retries: 1

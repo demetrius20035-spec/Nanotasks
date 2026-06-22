@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanotasks"
+version = "0.1.0"
+description = "Оркестратор разработки на нано-задачах: большая модель планирует, маленькие локальные модели исполняют."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=1.0.0",
+    "PyYAML>=6.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.6"]
+
+[project.scripts]
+nanotasks = "nanotasks.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["nanotasks*"]

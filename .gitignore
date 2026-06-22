@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Nanotasks runtime artifacts
+*.duckdb
+*.duckdb.wal
+data/
+output/
+config/config.yaml
+config/config.local.yaml
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
