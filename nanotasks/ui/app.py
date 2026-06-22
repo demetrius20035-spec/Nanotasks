@@ -211,6 +211,9 @@ class MainWindow(QMainWindow):
         self.variant_combo = QComboBox()
         self.variant_combo.currentIndexChanged.connect(self._on_variant_changed)
         var_row.addWidget(self.variant_combo, 1)
+        self.btn_diff_variant = QPushButton("Дифф вар.")
+        self.btn_diff_variant.clicked.connect(self._on_diff_variant)
+        var_row.addWidget(self.btn_diff_variant)
         self.btn_select_variant = QPushButton("Выбрать вариант")
         self.btn_select_variant.clicked.connect(self._on_select_variant)
         var_row.addWidget(self.btn_select_variant)
@@ -352,6 +355,7 @@ class MainWindow(QMainWindow):
         multi = len(self._variants) > 1
         self.variant_combo.setEnabled(multi)
         self.btn_select_variant.setEnabled(multi)
+        self.btn_diff_variant.setEnabled(multi)
         self._show_current_artifact()
 
     def _show_current_artifact(self) -> None:
@@ -400,17 +404,51 @@ class MainWindow(QMainWindow):
             self._populate_versions(self.current_task_id)
             self._load_feedback(self.current_task_id)
 
+    @staticmethod
+    def _unified(a: str, b: str, a_label: str, b_label: str) -> str:
+        diff = difflib.unified_diff(
+            a.splitlines(), b.splitlines(),
+            fromfile=a_label, tofile=b_label, lineterm="",
+        )
+        return "\n".join(diff) or "(идентичны)"
+
     def _on_diff(self) -> None:
         idx = self.version_combo.currentData()
         if idx is None or idx == 0:
             QMessageBox.information(self, "Дифф", "Нет предыдущей версии для сравнения.")
             return
         prev, cur = self._versions[idx - 1], self._versions[idx]
-        diff = difflib.unified_diff(
-            prev.content.splitlines(), cur.content.splitlines(),
-            fromfile=f"v{prev.version}", tofile=f"v{cur.version}", lineterm="",
+        text = self._unified(prev.content, cur.content, f"v{prev.version}", f"v{cur.version}")
+        self._show_text(f"Дифф v{prev.version} → v{cur.version}", text)
+
+    def _variant_diff_text(self) -> str | None:
+        """Дифф показанного кандидата против выбранного (✓) в том же раунде.
+
+        None — сравнивать не с чем (один кандидат либо показан сам выбранный).
+        Базой служит вариант с selected; если его нет — вариант 0.
+        """
+        vidx = self.variant_combo.currentData()
+        if vidx is None or len(self._variants) < 2:
+            return None
+        shown = self._variants[vidx]
+        base = next((v for v in self._variants if v.selected), self._variants[0])
+        if shown.variant == base.variant:
+            return None
+        return self._unified(
+            base.content, shown.content,
+            f"вариант {base.variant} ✓", f"вариант {shown.variant}",
         )
-        self._show_text(f"Дифф v{prev.version} → v{cur.version}", "\n".join(diff) or "(идентичны)")
+
+    def _on_diff_variant(self) -> None:
+        text = self._variant_diff_text()
+        if text is None:
+            QMessageBox.information(
+                self, "Дифф вариантов",
+                "Выбери в списке кандидат, отличный от выбранного (✓).",
+            )
+            return
+        version = self._current_version()
+        self._show_text(f"Дифф вариантов (v{version})", text)
 
     def _busy(self) -> bool:
         """Идёт фоновая запись в БД (активная генерация, аудит или ветвление)?"""

@@ -91,3 +91,27 @@ def test_version_switch_reloads_variants(window):
     assert window.version_combo.currentText() == "v1"
     assert window.variant_combo.count() == 3
     assert window.btn_select_variant.isEnabled()
+
+
+def test_variant_diff_against_selected(window):
+    # вариант 0 выбран по умолчанию (✓) и служит базой сравнения
+    _seed(window, ["def f():\n    return 1\n",
+                   "def f():\n    return 2\n",
+                   "def f():\n    return 3\n"])
+    assert window.btn_diff_variant.isEnabled()
+    window.variant_combo.setCurrentIndex(2)                # показываем третий кандидат
+    text = window._variant_diff_text()
+    assert text is not None
+    assert "вариант 0 ✓" in text and "вариант 2" in text   # направление база → показанный
+    assert "-    return 1" in text and "+    return 3" in text
+
+
+def test_variant_diff_none_when_showing_selected(window):
+    _seed(window, ["AAA", "BBB", "CCC"])                   # по умолчанию показан выбранный (0)
+    assert window._variant_diff_text() is None             # сам с собой не сравниваем
+
+
+def test_variant_diff_disabled_for_single(window):
+    _seed(window, ["only"])
+    assert not window.btn_diff_variant.isEnabled()
+    assert window._variant_diff_text() is None
