@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+import difflib
 import queue
 
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QApplication, QComboBox, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QTextEdit,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -110,9 +112,12 @@ class MainWindow(QMainWindow):
         self.db = Database(config.database_path)
         self.repo = Repository(self.db.con)
         self.current_project_id: int | None = None
+        self.current_task_id: int | None = None
         self.worker: RunWorker | None = None
         self.audit_worker: AuditWorker | None = None
         self._awaiting_review = False
+        self._items: dict[int, QTreeWidgetItem] = {}
+        self._versions: list = []
 
         self.setWindowTitle("Nanotasks — оркестратор нано-задач")
         self.resize(1100, 720)
@@ -155,11 +160,36 @@ class MainWindow(QMainWindow):
         self.prompt_view = QTextEdit()
         self.prompt_view.setReadOnly(True)
         rl.addWidget(self.prompt_view, 1)
-        self.code_label = QLabel("Сгенерированный код:")
+
+        # Строка версий: выбор версии · дифф · откат
+        ver_row = QHBoxLayout()
+        ver_row.addWidget(QLabel("Версия:"))
+        self.version_combo = QComboBox()
+        self.version_combo.currentIndexChanged.connect(self._on_version_changed)
+        ver_row.addWidget(self.version_combo, 1)
+        self.btn_diff = QPushButton("Дифф с пред.")
+        self.btn_rollback = QPushButton("Откатить к версии")
+        self.btn_diff.clicked.connect(self._on_diff)
+        self.btn_rollback.clicked.connect(self._on_rollback)
+        ver_row.addWidget(self.btn_diff)
+        ver_row.addWidget(self.btn_rollback)
+        rl.addLayout(ver_row)
+
+        self.code_label = QLabel("Код:")
         rl.addWidget(self.code_label)
         self.code_view = QTextEdit()
         self.code_view.setLineWrapMode(QTextEdit.NoWrap)
+        self.code_view.setFont(QFont("monospace"))
         rl.addWidget(self.code_view, 2)
+        self.btn_save_edit = QPushButton("💾 Сохранить правку как новую версию")
+        self.btn_save_edit.clicked.connect(self._on_save_edit)
+        rl.addWidget(self.btn_save_edit)
+
+        rl.addWidget(QLabel("Замечания (незакрытые):"))
+        self.feedback_view = QTextEdit()
+        self.feedback_view.setReadOnly(True)
+        self.feedback_view.setFixedHeight(80)
+        rl.addWidget(self.feedback_view)
 
         review_row = QHBoxLayout()
         self.btn_approve = QPushButton("✓ Одобрить")
@@ -218,29 +248,124 @@ class MainWindow(QMainWindow):
 
     def _refresh_tree(self) -> None:
         self.tree.clear()
+        self._items = {}
         if self.current_project_id is None:
             return
-        tasks = self.repo.list_tasks(self.current_project_id)
-        items: dict[int, QTreeWidgetItem] = {}
-        for t in tasks:
+        for t in self.repo.list_tasks(self.current_project_id):
             item = QTreeWidgetItem([f"[{t.key}] {t.title}", t.status.value, t.file_path or ""])
             item.setData(0, Qt.UserRole, t.id)
-            items[t.id] = item
-            parent = items.get(t.parent_id) if t.parent_id else None
+            self._items[t.id] = item
+            parent = self._items.get(t.parent_id) if t.parent_id else None
             (parent.addChild(item) if parent else self.tree.addTopLevelItem(item))
         self.tree.expandAll()
+        if self.current_task_id in self._items:
+            self.tree.setCurrentItem(self._items[self.current_task_id])
 
     def _on_select_task(self) -> None:
         sel = self.tree.selectedItems()
         if not sel:
             return
-        task_id = sel[0].data(0, Qt.UserRole)
-        prompt = self.repo.latest_prompt(task_id)
-        art = self.repo.latest_artifact(task_id)
+        self.current_task_id = sel[0].data(0, Qt.UserRole)
+        prompt = self.repo.latest_prompt(self.current_task_id)
         self.prompt_view.setPlainText(prompt.content if prompt else "")
-        self.code_view.setPlainText(art.content if art else "")
-        self.code_label.setText(f"Сгенерированный код (версия {art.version}):" if art
-                                else "Сгенерированный код:")
+        self._populate_versions(self.current_task_id)
+        self._load_feedback(self.current_task_id)
+
+    def _populate_versions(self, task_id: int) -> None:
+        self._versions = self.repo.list_artifact_versions(task_id)
+        self.version_combo.blockSignals(True)
+        self.version_combo.clear()
+        for idx, art in enumerate(self._versions):
+            self.version_combo.addItem(f"v{art.version}", idx)
+        if self._versions:
+            self.version_combo.setCurrentIndex(len(self._versions) - 1)
+        self.version_combo.blockSignals(False)
+        self._show_selected_version()
+
+    def _show_selected_version(self) -> None:
+        idx = self.version_combo.currentData()
+        if idx is None or not self._versions:
+            self.code_view.clear()
+            self.code_label.setText("Код:")
+            return
+        art = self._versions[idx]
+        self.code_view.setPlainText(art.content)
+        self.code_label.setText(f"Код (версия {art.version}):")
+
+    def _on_version_changed(self) -> None:
+        self._show_selected_version()
+
+    def _load_feedback(self, task_id: int) -> None:
+        items = self.repo.unresolved_feedback(task_id)
+        self.feedback_view.setPlainText(
+            "\n".join(f"• [{f.source}] {f.content}" for f in items) or "— нет —"
+        )
+
+    def _refresh_detail(self) -> None:
+        if self.current_task_id is not None:
+            self._populate_versions(self.current_task_id)
+            self._load_feedback(self.current_task_id)
+
+    def _on_diff(self) -> None:
+        idx = self.version_combo.currentData()
+        if idx is None or idx == 0:
+            QMessageBox.information(self, "Дифф", "Нет предыдущей версии для сравнения.")
+            return
+        prev, cur = self._versions[idx - 1], self._versions[idx]
+        diff = difflib.unified_diff(
+            prev.content.splitlines(), cur.content.splitlines(),
+            fromfile=f"v{prev.version}", tofile=f"v{cur.version}", lineterm="",
+        )
+        self._show_text(f"Дифф v{prev.version} → v{cur.version}", "\n".join(diff) or "(идентичны)")
+
+    def _busy(self) -> bool:
+        """Идёт фоновая запись в БД (активная генерация или аудит)?"""
+        run_busy = self.worker is not None and self.worker.isRunning() and not self._awaiting_review
+        audit_busy = self.audit_worker is not None and self.audit_worker.isRunning()
+        return run_busy or audit_busy
+
+    def _on_rollback(self) -> None:
+        idx = self.version_combo.currentData()
+        if idx is None or self.current_task_id is None:
+            return
+        if self._busy():
+            QMessageBox.information(self, "Занято", "Дождись окончания прогона/аудита.")
+            return
+        version = self._versions[idx].version
+        art = self.repo.rollback_artifact(self.current_task_id, version)
+        if art:
+            self._log(f"↩ откат к v{version} → новая v{art.version}")
+            self._refresh_tree()
+            self._refresh_detail()
+
+    def _on_save_edit(self) -> None:
+        if self.current_task_id is None:
+            return
+        if self._busy():
+            QMessageBox.information(self, "Занято", "Дождись окончания прогона/аудита.")
+            return
+        task = self.repo.get_task(self.current_task_id)
+        self.repo.save_artifact(
+            self.current_task_id, self.code_view.toPlainText(),
+            model="manual", file_path=task.file_path if task else None,
+        )
+        self._log("💾 сохранена ручная правка как новая версия")
+        self._refresh_detail()
+
+    def _show_text(self, title: str, text: str) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(700, 500)
+        layout = QVBoxLayout(dlg)
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setFont(QFont("monospace"))
+        view.setPlainText(text)
+        layout.addWidget(view)
+        close = QPushButton("Закрыть")
+        close.clicked.connect(dlg.accept)
+        layout.addWidget(close)
+        dlg.exec()
 
     # ── действия ────────────────────────────────────────────────────────────
     def _on_import(self) -> None:
@@ -338,9 +463,10 @@ class MainWindow(QMainWindow):
 
     def _on_review_requested(self, task, art) -> None:
         self._awaiting_review = True
-        prompt = self.repo.latest_prompt(task.id)
-        self.prompt_view.setPlainText(prompt.content if prompt else "")
-        self.code_view.setPlainText(art.content if art else "")
+        self._refresh_tree()                       # показать свежие статусы
+        item = self._items.get(task.id)
+        if item is not None:
+            self.tree.setCurrentItem(item)         # подтянет промпт/версии/замечания
         self._enable_review(True)
         self._log(f"⏸ ревью: [{task.key}] {task.title}")
 
