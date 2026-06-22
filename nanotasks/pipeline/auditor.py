@@ -14,9 +14,11 @@ import itertools
 
 import yaml
 
+from collections import deque
+
 from ..db import Repository
 from ..llm import LLMClient
-from ..models import Task, TaskStatus, TaskType
+from ..models import DONE_STATES, Task, TaskStatus, TaskType
 from .assembler import render_tree
 from .coder import strip_code_fences
 
@@ -74,9 +76,14 @@ def run_audit(client: LLMClient, repo: Repository, project_id: int,
     return parse_audit(raw)
 
 
-def apply_audit(repo: Repository, project_id: int, parsed: dict, audit_id: int) -> tuple[int, int]:
-    """Применяет разбор: правки → фидбек+needs_fix, новые пункты → задачи."""
+def apply_audit(repo: Repository, project_id: int, parsed: dict, audit_id: int,
+                cascade: bool = False) -> tuple[int, int]:
+    """Применяет разбор: правки → фидбек+needs_fix, новые пункты → задачи.
+
+    При cascade=True дополнительно переоткрывает пункты, зависящие от исправленных.
+    """
     n_fix = 0
+    fixed_keys: list[str] = []
     for fix in parsed.get("fixes") or []:
         key = str(fix.get("key", "")).strip()
         instruction = (fix.get("instruction") or fix.get("issue") or "").strip()
@@ -89,10 +96,42 @@ def apply_audit(repo: Repository, project_id: int, parsed: dict, audit_id: int) 
             continue
         repo.add_feedback(task.id, instruction, source="audit", audit_id=audit_id)
         repo.reopen_task(task.id)
+        fixed_keys.append(key)
         n_fix += 1
+
+    if cascade and fixed_keys:
+        _cascade_reopen(repo, project_id, fixed_keys, audit_id)
 
     n_add = _add_nodes(repo, project_id, parsed.get("additions") or [])
     return n_fix, n_add
+
+
+def _cascade_reopen(repo: Repository, project_id: int, seed_keys: list[str],
+                    audit_id: int) -> int:
+    """Транзитивно переоткрывает готовые пункты, зависящие от исправленных."""
+    seen = set(seed_keys)
+    queue: deque[str] = deque(seed_keys)
+    count = 0
+    while queue:
+        key = queue.popleft()
+        for dep in repo.dependents(project_id, [key]):
+            if dep.key in seen:
+                continue
+            seen.add(dep.key)
+            queue.append(dep.key)
+            if dep.is_leaf and dep.status in DONE_STATES:
+                repo.add_feedback(
+                    dep.id,
+                    f"Зависимость {key} изменилась — проверь совместимость и при "
+                    f"необходимости поправь.",
+                    source="audit", audit_id=audit_id,
+                )
+                repo.reopen_task(dep.id)
+                count += 1
+    if count:
+        repo.log_event(f"Каскад: переоткрыто зависимых пунктов: {count}",
+                       project_id=project_id)
+    return count
 
 
 def _add_nodes(repo: Repository, project_id: int, nodes: list) -> int:

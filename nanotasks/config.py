@@ -30,6 +30,7 @@ class Config:
     models: dict[str, ModelConfig] = field(default_factory=dict)
     run_mode: str = "review"   # review | auto
     max_retries: int = 1
+    cascade_dependents: bool = False   # переоткрывать зависимые пункты при правке
     verify_commands: list[str] = field(default_factory=list)  # компиляция/запуск/тесты
     source_path: str | None = None
 
@@ -64,6 +65,7 @@ class Config:
             models=models,
             run_mode=run.get("mode", "review"),
             max_retries=int(run.get("max_retries", 1)),
+            cascade_dependents=bool(run.get("cascade_dependents", False)),
             verify_commands=list(verify.get("commands") or []),
             source_path=cfg_path,
         )

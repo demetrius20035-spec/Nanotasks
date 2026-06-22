@@ -12,15 +12,19 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
+import yaml
+
 from .config import Config
 from .db import Database, Repository
-from .importer import import_todo
+from .importer import import_todo, import_todo_data
 from .llm import LLMError, build_client
 from .pipeline import (
-    Orchestrator, ReviewDecision, assemble, format_errors, render_tree, run_verification,
+    Orchestrator, ReviewDecision, assemble, format_errors, render_tree,
+    run_architect, run_verification,
 )
 
 
@@ -37,6 +41,29 @@ def cmd_import(args) -> None:
         proj = repo.get_project(pid)
         print(f"Импортирован проект #{pid}: {proj.name}\n")
         print(render_tree(repo, pid))
+    finally:
+        db.close()
+
+
+def cmd_plan(args) -> None:
+    """Архитектор: бриф → ТЗ+ФС+TODO (YAML) → импорт в базу."""
+    config, db, repo = _open(args.config)
+    try:
+        brief = Path(args.brief).read_text(encoding="utf-8")
+        client = build_client(config.model("architect"), "architect")
+        print(f"Архитектор ({client.model}) составляет план…")
+        plan = run_architect(client, brief, args.language)
+
+        save_path = args.save or str(Path(args.brief).with_suffix("")) + ".plan.yaml"
+        Path(save_path).write_text(
+            yaml.safe_dump(plan, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
+        print(f"План сохранён: {save_path}")
+
+        if not args.no_import:
+            pid = import_todo_data(repo, plan, source=save_path)
+            print(f"Импортирован проект #{pid}\n")
+            print(render_tree(repo, pid))
     finally:
         db.close()
 
@@ -225,6 +252,33 @@ def cmd_versions(args) -> None:
         db.close()
 
 
+def cmd_rollback(args) -> None:
+    config, db, repo = _open(args.config)
+    try:
+        task = repo.get_task_by_key(args.project_id, args.key)
+        if task is None:
+            print(f"Пункт {args.key} не найден.")
+            return
+        art = repo.rollback_artifact(task.id, args.version)
+        if art is None:
+            print(f"У пункта {args.key} нет версии {args.version}.")
+            return
+        print(f"Откат [{task.key}] к содержимому v{args.version} → "
+              f"новая v{art.version} (статус approved).")
+    finally:
+        db.close()
+
+
+def cmd_export(args) -> None:
+    config, db, repo = _open(args.config)
+    try:
+        base, written = assemble(repo, args.project_id, config.output_dir)
+        archive = shutil.make_archive(str(base), "zip", root_dir=str(base))
+        print(f"Экспортировано {len(written)} файлов → {archive}")
+    finally:
+        db.close()
+
+
 def cmd_delete(args) -> None:
     config, db, repo = _open(args.config)
     try:
@@ -248,6 +302,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("import", parents=[common], help="импорт TODO (YAML) как новый проект")
     p.add_argument("file")
     p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("plan", parents=[common], help="архитектор: бриф → ТЗ+ФС+TODO → импорт")
+    p.add_argument("brief", help="файл с кратким брифом проекта")
+    p.add_argument("--language", help="целевой язык кода")
+    p.add_argument("--save", help="куда сохранить сгенерированный план (YAML)")
+    p.add_argument("--no-import", action="store_true", help="только сгенерировать план, не импортировать")
+    p.set_defaults(func=cmd_plan)
 
     sub.add_parser("projects", parents=[common], help="список проектов").set_defaults(func=cmd_projects)
 
@@ -283,6 +344,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("project_id", type=int)
     p.add_argument("key", help="ключ пункта, напр. 2.1")
     p.set_defaults(func=cmd_versions)
+
+    p = sub.add_parser("rollback", parents=[common], help="откатить пункт к старой версии")
+    p.add_argument("project_id", type=int)
+    p.add_argument("key", help="ключ пункта, напр. 2.1")
+    p.add_argument("version", type=int, help="номер версии")
+    p.set_defaults(func=cmd_rollback)
+
+    p = sub.add_parser("export", parents=[common], help="собрать и упаковать проект в zip")
+    p.add_argument("project_id", type=int)
+    p.set_defaults(func=cmd_export)
 
     p = sub.add_parser("delete", parents=[common], help="удалить проект из БД")
     p.add_argument("project_id", type=int)

@@ -90,7 +90,9 @@ class Orchestrator:
         audit_id = self.repo.create_audit(
             project_id, auditor_client.model, parsed.get("audit", ""), errors or ""
         )
-        n_fix, n_add = apply_audit(self.repo, project_id, parsed, audit_id)
+        n_fix, n_add = apply_audit(
+            self.repo, project_id, parsed, audit_id, cascade=self.config.cascade_dependents
+        )
         return audit_id, parsed, n_fix, n_add
 
     # ── полный прогон проекта ────────────────────────────────────────────────

@@ -138,6 +138,11 @@ class Repository:
         ).fetchall()
         return [_to_task(r) for r in rows]
 
+    def dependents(self, project_id: int, keys: list[str]) -> list[Task]:
+        """Пункты, чьи depends_on содержат любой из keys (один уровень)."""
+        keyset = set(keys)
+        return [t for t in self.list_tasks(project_id) if keyset & set(t.depends_on)]
+
     def update_task_status(self, task_id: int, status: TaskStatus) -> None:
         self.con.execute(
             "UPDATE tasks SET status = ?, updated_at = now() WHERE id = ?",
@@ -217,6 +222,21 @@ class Repository:
             [task_id],
         ).fetchall()
         return [_to_artifact(r) for r in rows]
+
+    def rollback_artifact(self, task_id: int, version: int) -> Artifact | None:
+        """Делает содержимое старой версии новой (последней) версией.
+
+        Пункт переводится в approved — выбранную версию можно сразу собрать.
+        """
+        row = self.con.execute(
+            "SELECT content, file_path, model FROM artifacts WHERE task_id = ? AND version = ?",
+            [task_id, version],
+        ).fetchone()
+        if not row:
+            return None
+        self.save_artifact(task_id, row[0], None, row[2], row[1])
+        self.update_task_status(task_id, TaskStatus.APPROVED)
+        return self.latest_artifact(task_id)
 
     def leaf_artifacts(self, project_id: int) -> list[tuple[Task, Artifact]]:
         """Пары (лист, его последний артефакт) — для подачи всего кода аудитору."""

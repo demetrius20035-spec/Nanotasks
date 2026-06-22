@@ -23,7 +23,14 @@ class ImportError_(Exception):
 def import_todo(repo: Repository, path: str) -> int:
     """Импортирует YAML-файл TODO как новый проект. Возвращает id проекта."""
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    return import_todo_data(repo, data, source=str(path))
 
+
+def import_todo_data(repo: Repository, data: dict, source: str = "<inline>") -> int:
+    """Импортирует уже разобранный TODO (dict) как новый проект.
+
+    Используется и при импорте файла, и при генерации плана архитектором.
+    """
     proj = data.get("project")
     if not proj or not proj.get("name"):
         raise ImportError_("В файле нет блока `project` с полем `name`.")
@@ -76,7 +83,7 @@ def import_todo(repo: Repository, path: str) -> int:
     walk(data.get("tasks"), None)
 
     _validate_dependencies(repo, project_id, seen_keys)
-    repo.log_event(f"Импортирован проект из {path}: пунктов {len(seen_keys)}",
+    repo.log_event(f"Импортирован проект из {source}: пунктов {len(seen_keys)}",
                    project_id=project_id)
     return project_id
 
