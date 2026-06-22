@@ -16,9 +16,14 @@ dependencies = [
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.6"]
+dev = ["pytest>=7"]
 
 [project.scripts]
 nanotasks = "nanotasks.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["nanotasks*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

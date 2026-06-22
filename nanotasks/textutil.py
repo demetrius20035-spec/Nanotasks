@@ -11,7 +11,8 @@ import re
 import yaml
 
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
-_TOP_KEY_RE = re.compile(r"^[A-Za-z_][\w-]*:\s*(\|.*)?$")
+# Строка-ключ верхнего уровня: «key:» либо «key: значение».
+_TOP_KEY_RE = re.compile(r"^[A-Za-z_][\w-]*:(\s.*)?$")
 
 
 def strip_code_fences(text: str) -> str:
