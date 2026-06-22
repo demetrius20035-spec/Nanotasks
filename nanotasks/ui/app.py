@@ -102,6 +102,34 @@ class AuditWorker(QThread):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class BranchWorker(QThread):
+    """Ветвление в фоне: общий нано-промпт → несколько кандидатов на пункт."""
+
+    log = Signal(str)
+    done = Signal(int)             # сколько вариантов сгенерировано
+    failed = Signal(str)
+
+    def __init__(self, config: Config, db: Database, task_id: int, n: int):
+        super().__init__()
+        self.config = config
+        self.db = db
+        self.task_id = task_id
+        self.n = n
+
+    def run(self) -> None:
+        try:
+            repo = Repository(self.db.cursor())
+            task = repo.get_task(self.task_id)
+            project = repo.get_project(task.project_id)
+            pb = build_client(self.config.model("prompt_builder"), "prompt_builder")
+            cd = build_client(self.config.model("coder"), "coder")
+            orch = Orchestrator(repo, self.config, pb, cd)
+            variants = orch.branch_task(task, project.language, self.n)
+            self.done.emit(len(variants))
+        except (LLMError, Exception) as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Главное окно
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,9 +143,11 @@ class MainWindow(QMainWindow):
         self.current_task_id: int | None = None
         self.worker: RunWorker | None = None
         self.audit_worker: AuditWorker | None = None
+        self.branch_worker: BranchWorker | None = None
         self._awaiting_review = False
         self._items: dict[int, QTreeWidgetItem] = {}
         self._versions: list = []
+        self._variants: list = []
 
         self.setWindowTitle("Nanotasks — оркестратор нано-задач")
         self.resize(1100, 720)
@@ -175,6 +205,17 @@ class MainWindow(QMainWindow):
         ver_row.addWidget(self.btn_rollback)
         rl.addLayout(ver_row)
 
+        # Строка вариантов: кандидаты выбранного раунда · выбор лучшего
+        var_row = QHBoxLayout()
+        var_row.addWidget(QLabel("Вариант:"))
+        self.variant_combo = QComboBox()
+        self.variant_combo.currentIndexChanged.connect(self._on_variant_changed)
+        var_row.addWidget(self.variant_combo, 1)
+        self.btn_select_variant = QPushButton("Выбрать вариант")
+        self.btn_select_variant.clicked.connect(self._on_select_variant)
+        var_row.addWidget(self.btn_select_variant)
+        rl.addLayout(var_row)
+
         self.code_label = QLabel("Код:")
         rl.addWidget(self.code_label)
         self.code_view = QTextEdit()
@@ -213,13 +254,16 @@ class MainWindow(QMainWindow):
         self.btn_stop = QPushButton("■ Стоп")
         self.btn_assemble = QPushButton("🗂 Собрать")
         self.btn_audit = QPushButton("🔍 Аудит")
+        self.btn_branch = QPushButton("🌿 Ветвить")
         self.btn_run.clicked.connect(lambda: self._start_run(auto=False))
         self.btn_auto.clicked.connect(lambda: self._start_run(auto=True))
         self.btn_stop.clicked.connect(self._stop_run)
         self.btn_assemble.clicked.connect(self._on_assemble)
         self.btn_audit.clicked.connect(self._start_audit)
+        self.btn_branch.clicked.connect(self._start_branch)
         self.btn_stop.setEnabled(False)
-        for b in (self.btn_run, self.btn_auto, self.btn_stop, self.btn_assemble, self.btn_audit):
+        for b in (self.btn_run, self.btn_auto, self.btn_stop, self.btn_assemble,
+                  self.btn_audit, self.btn_branch):
             run_row.addWidget(b)
         root.addLayout(run_row)
 
@@ -280,20 +324,70 @@ class MainWindow(QMainWindow):
         if self._versions:
             self.version_combo.setCurrentIndex(len(self._versions) - 1)
         self.version_combo.blockSignals(False)
-        self._show_selected_version()
+        self._populate_variants()
 
-    def _show_selected_version(self) -> None:
+    def _current_version(self) -> int | None:
+        """Номер раунда (version), выбранного в комбобоксе версий."""
         idx = self.version_combo.currentData()
         if idx is None or not self._versions:
+            return None
+        return self._versions[idx].version
+
+    def _populate_variants(self) -> None:
+        """Заполнить список кандидатов выбранного раунда и показать выбранный."""
+        version = self._current_version()
+        self.variant_combo.blockSignals(True)
+        self.variant_combo.clear()
+        self._variants = []
+        if version is not None and self.current_task_id is not None:
+            self._variants = self.repo.list_variants(self.current_task_id, version)
+            current = 0
+            for i, v in enumerate(self._variants):
+                self.variant_combo.addItem(f"вариант {v.variant}{' ✓' if v.selected else ''}", i)
+                if v.selected:
+                    current = i
+            if self._variants:
+                self.variant_combo.setCurrentIndex(current)
+        self.variant_combo.blockSignals(False)
+        multi = len(self._variants) > 1
+        self.variant_combo.setEnabled(multi)
+        self.btn_select_variant.setEnabled(multi)
+        self._show_current_artifact()
+
+    def _show_current_artifact(self) -> None:
+        """Код-вью показывает кандидата, выбранного в комбобоксе вариантов (превью)."""
+        vidx = self.variant_combo.currentData()
+        if vidx is None or not self._variants:
             self.code_view.clear()
             self.code_label.setText("Код:")
             return
-        art = self._versions[idx]
+        art = self._variants[vidx]
         self.code_view.setPlainText(art.content)
-        self.code_label.setText(f"Код (версия {art.version}):")
+        tail = f", вариант {art.variant} из {len(self._variants)}" if len(self._variants) > 1 else ""
+        mark = " ✓" if art.selected else ""
+        self.code_label.setText(f"Код (версия {art.version}{tail}{mark}):")
 
     def _on_version_changed(self) -> None:
-        self._show_selected_version()
+        self._populate_variants()
+
+    def _on_variant_changed(self) -> None:
+        self._show_current_artifact()
+
+    def _on_select_variant(self) -> None:
+        if self.current_task_id is None or not self._variants:
+            return
+        if self._busy():
+            QMessageBox.information(self, "Занято", "Дождись окончания прогона/аудита.")
+            return
+        vidx = self.variant_combo.currentData()
+        if vidx is None:
+            return
+        variant = self._variants[vidx].variant
+        version = self._current_version()
+        art = self.repo.select_variant(self.current_task_id, variant, version)
+        if art:
+            self._log(f"✓ выбран вариант {variant} (v{version}) как текущий")
+            self._refresh_detail()
 
     def _load_feedback(self, task_id: int) -> None:
         items = self.repo.unresolved_feedback(task_id)
@@ -319,10 +413,15 @@ class MainWindow(QMainWindow):
         self._show_text(f"Дифф v{prev.version} → v{cur.version}", "\n".join(diff) or "(идентичны)")
 
     def _busy(self) -> bool:
-        """Идёт фоновая запись в БД (активная генерация или аудит)?"""
+        """Идёт фоновая запись в БД (активная генерация, аудит или ветвление)?"""
         run_busy = self.worker is not None and self.worker.isRunning() and not self._awaiting_review
         audit_busy = self.audit_worker is not None and self.audit_worker.isRunning()
-        return run_busy or audit_busy
+        branch_busy = self.branch_worker is not None and self.branch_worker.isRunning()
+        return run_busy or audit_busy or branch_busy
+
+    def _any_worker_running(self) -> bool:
+        return any(w is not None and w.isRunning()
+                   for w in (self.worker, self.audit_worker, self.branch_worker))
 
     def _on_rollback(self) -> None:
         idx = self.version_combo.currentData()
@@ -396,7 +495,7 @@ class MainWindow(QMainWindow):
         self._refresh_tree()
 
     def _start_run(self, auto: bool) -> None:
-        if self.current_project_id is None or (self.worker and self.worker.isRunning()):
+        if self.current_project_id is None or self._any_worker_running():
             return
         self.worker = RunWorker(self.config, self.db, self.current_project_id, auto)
         self.worker.event.connect(self._on_event)
@@ -413,11 +512,7 @@ class MainWindow(QMainWindow):
             self._log("■ Останавливаю после текущего пункта…")
 
     def _start_audit(self) -> None:
-        if self.current_project_id is None:
-            return
-        if (self.worker and self.worker.isRunning()) or (
-            self.audit_worker and self.audit_worker.isRunning()
-        ):
+        if self.current_project_id is None or self._any_worker_running():
             return
         self.audit_worker = AuditWorker(self.config, self.db, self.current_project_id)
         self.audit_worker.log.connect(self._log)
@@ -426,6 +521,33 @@ class MainWindow(QMainWindow):
         self._set_running(True)
         self._log("🔍 Старт аудита большой моделью…")
         self.audit_worker.start()
+
+    def _start_branch(self) -> None:
+        if self.current_task_id is None or self._any_worker_running():
+            return
+        task = self.repo.get_task(self.current_task_id)
+        if task is None or not task.is_leaf:
+            QMessageBox.information(self, "Ветвление", "Выбери пункт-лист (не группу).")
+            return
+        n, ok = QInputDialog.getInt(
+            self, "Ветвление", "Сколько кандидатов сгенерировать?",
+            max(2, self.config.variants), 2, 6,
+        )
+        if not ok:
+            return
+        self.branch_worker = BranchWorker(self.config, self.db, self.current_task_id, n)
+        self.branch_worker.log.connect(self._log)
+        self.branch_worker.done.connect(self._on_branch_done)
+        self.branch_worker.failed.connect(self._on_run_failed)
+        self._set_running(True)
+        self._log(f"🌿 Ветвление [{task.key}] {task.title}: {n} кандидатов…")
+        self.branch_worker.start()
+
+    def _on_branch_done(self, n_variants: int) -> None:
+        self._set_running(False)
+        self._log(f"🌿 Готово вариантов: {n_variants}. Выбери лучший в панели «Вариант».")
+        self._refresh_tree()
+        self._refresh_detail()
 
     def _on_audit_done(self, n_fix: int, n_add: int, audit_text: str) -> None:
         self._set_running(False)
@@ -490,6 +612,7 @@ class MainWindow(QMainWindow):
         self.btn_auto.setEnabled(not running)
         self.btn_assemble.setEnabled(not running)
         self.btn_audit.setEnabled(not running)
+        self.btn_branch.setEnabled(not running)
         self.btn_stop.setEnabled(running)
         if not running:
             self._enable_review(False)
@@ -504,6 +627,8 @@ class MainWindow(QMainWindow):
             self.worker.wait(3000)
         if self.audit_worker and self.audit_worker.isRunning():
             self.audit_worker.wait(3000)
+        if self.branch_worker and self.branch_worker.isRunning():
+            self.branch_worker.wait(3000)
         self.db.close()
         super().closeEvent(event)
 
