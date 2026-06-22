@@ -17,8 +17,9 @@ from ..db import Repository
 from ..llm import LLMClient, LLMError
 from ..models import DONE_STATES, Artifact, Task, TaskStatus
 from .auditor import apply_audit, run_audit
-from .coder import generate_code
+from .coder import generate_code, variant_temperatures
 from .context import assemble_context
+from .judge import select_best
 from .prompt_builder import build_nano_prompt
 
 
@@ -43,10 +44,13 @@ class Orchestrator:
         self.prompt_client = prompt_client
         self.coder_client = coder_client
 
-    # ── один пункт целиком: нано-промпт → код ────────────────────────────────
-    def process_task(self, task: Task, language: str) -> Artifact:
+    # ── нано-промпт (постановщик) ─────────────────────────────────────────────
+    def _prepare_prompt(self, task: Task, language: str) -> tuple[str, int]:
+        """Контекст + незакрытые замечания (+ текущий код) → нано-промпт, сохранить.
+
+        Возвращает (нано-промпт, prompt_id). Статус пункта → prompt_ready.
+        """
         context = assemble_context(self.repo, task)
-        # незакрытые замечания (от человека/аудита) + текущий код → исправление
         feedback = [f.content for f in self.repo.unresolved_feedback(task.id)]
         current = self.repo.latest_artifact(task.id)
         current_code = current.content if (current is not None and feedback) else None
@@ -58,13 +62,46 @@ class Orchestrator:
             task.id, "prompt_builder", nano, self.prompt_client.model
         )
         self.repo.update_task_status(task.id, TaskStatus.PROMPT_READY)
+        return nano, prompt_id
 
+    # ── один пункт целиком: нано-промпт → код ────────────────────────────────
+    def process_task(self, task: Task, language: str) -> Artifact:
+        nano, prompt_id = self._prepare_prompt(task, language)
         code = self._retry(lambda: generate_code(self.coder_client, nano))
         self.repo.save_artifact(
             task.id, code, prompt_id, self.coder_client.model, task.file_path
         )
         self.repo.update_task_status(task.id, TaskStatus.CODE_READY)
         return self.repo.latest_artifact(task.id)
+
+    # ── ветвление: несколько кандидатов на пункт → (опц.) выбор судьёй ─────────
+    def branch_task(self, task: Task, language: str, n: int = 2, *,
+                    judge_client: LLMClient | None = None) -> list[Artifact]:
+        """Сгенерировать n кандидатов одним раундом; если задан judge_client —
+        пометить рекомендованный им вариант. Статус → code_ready.
+
+        Выбор советующий: финальное слово за select_variant (человек/CLI).
+        Возвращает варианты раунда (в порядке индексов).
+        """
+        nano, prompt_id = self._prepare_prompt(task, language)
+        codes = [
+            self._retry(lambda t=t: generate_code(self.coder_client, nano, t))
+            for t in variant_temperatures(n)
+        ]
+        self.repo.save_variants(
+            task.id, [(c, self.coder_client.model) for c in codes], prompt_id, task.file_path
+        )
+        self.repo.update_task_status(task.id, TaskStatus.CODE_READY)
+
+        if judge_client is not None and len(codes) > 1:
+            context = assemble_context(self.repo, task)
+            idx, rationale = select_best(judge_client, task, codes, context)
+            self.repo.select_variant(task.id, idx)
+            self.repo.log_event(
+                f"Судья ({judge_client.model}) выбрал вариант {idx}: {rationale[:200]}",
+                task.project_id, task.id,
+            )
+        return self.repo.list_variants(task.id)
 
     def _deps_ready(self, task: Task) -> bool:
         for key in task.depends_on:

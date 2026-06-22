@@ -38,6 +38,23 @@ class MarkerCoder(LLMClient):
         return LLMResponse(content=code, model=self.model)
 
 
+class RecordingCoder(LLMClient):
+    """Кодер: запоминает температуры вызовов, отдаёт разное содержимое по очереди."""
+
+    name = "rec"
+    model = "fake-coder"
+
+    def __init__(self):
+        self.temperatures: list[float | None] = []
+        self.calls = 0
+
+    def complete(self, messages, temperature=None):
+        self.temperatures.append(temperature)
+        content = f"# cand{self.calls}\n"
+        self.calls += 1
+        return LLMResponse(content=content, model=self.model)
+
+
 class ScriptedClient(LLMClient):
     """Возвращает заранее заданные ответы по очереди (последний — повторно)."""
 

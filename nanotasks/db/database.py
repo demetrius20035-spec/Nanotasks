@@ -28,6 +28,25 @@ class Database:
         for statement in script.split(";"):
             if statement.strip():
                 self.con.execute(statement)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Однократные миграции для БД, созданных более ранней схемой.
+
+        Проверяем наличие колонок и добавляем только отсутствующие: в DuckDB
+        `ADD COLUMN IF NOT EXISTS` затирает значения дефолтом, так что повторять
+        его на каждом старте нельзя.
+        """
+        cols = {
+            r[0] for r in self.con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'artifacts'"
+            ).fetchall()
+        }
+        if "variant" not in cols:
+            self.con.execute("ALTER TABLE artifacts ADD COLUMN variant INTEGER DEFAULT 0")
+        if "selected" not in cols:
+            self.con.execute("ALTER TABLE artifacts ADD COLUMN selected BOOLEAN DEFAULT TRUE")
 
     def cursor(self):
         """Отдельный курсор для работы из другого потока (GUI-воркер)."""

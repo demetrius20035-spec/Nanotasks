@@ -59,6 +59,15 @@ models:
     temperature: 0.3
     timeout: 900
 
+  # СУДЬЯ — для `branch --judge` (выбор лучшего из вариантов). Необязательная роль:
+  # если её нет, judge-режим использует модель auditor. Раскомментируй при желании.
+  # judge:
+  #   provider: openai_compatible
+  #   base_url: http://localhost:11434/v1
+  #   model: qwen2.5:32b
+  #   temperature: 0.0
+  #   timeout: 900
+
   # ── Примеры внешних провайдеров (раскомментируй и подставь ключи) ──
   #
   # auditor:
@@ -85,6 +94,7 @@ models:
 run:
   mode: review              # review — пауза на каждом артефакте; auto — без пауз
   max_retries: 1
+  variants: 1               # кандидатов на пункт по умолчанию для `branch` (≥2 — ветвление)
   cascade_dependents: false # при правке файла переоткрывать зависящие от него пункты
 
 # Верификация собранного проекта. Команды выполняются в каталоге output/<проект>.

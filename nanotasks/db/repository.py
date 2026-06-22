@@ -45,11 +45,17 @@ def _to_project(row) -> Project:
     )
 
 
+_ARTIFACT_COLS = (
+    "id, task_id, prompt_id, model, content, file_path, version, variant, selected, created_at"
+)
+
+
 def _to_artifact(row) -> Artifact:
     return Artifact(
         id=row[0], task_id=row[1], prompt_id=row[2], model=row[3],
-        content=row[4], file_path=row[5], version=row[6],
-        created_at=str(row[7]) if row[7] is not None else None,
+        content=row[4], file_path=row[5], version=row[6], variant=row[7],
+        selected=bool(row[8]),
+        created_at=str(row[9]) if row[9] is not None else None,
     )
 
 
@@ -178,31 +184,93 @@ class Repository:
         )
 
     # ── Артефакты (код) ──────────────────────────────────────────────────────
+    def _insert_artifact(self, task_id, content, prompt_id, model, file_path,
+                         version, variant, selected) -> int:
+        row = self.con.execute(
+            "INSERT INTO artifacts(task_id, prompt_id, model, content, file_path, "
+            "version, variant, selected) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            [task_id, prompt_id, model, content, file_path, version, variant, selected],
+        ).fetchone()
+        return row[0]
+
     def save_artifact(
         self, task_id: int, content: str, prompt_id: int | None = None,
         model: str | None = None, file_path: str | None = None,
     ) -> int:
+        """Новый раунд из одного кандидата (variant 0, selected)."""
         version = self._next_version(task_id)
-        row = self.con.execute(
-            "INSERT INTO artifacts(task_id, prompt_id, model, content, file_path, version) "
-            "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
-            [task_id, prompt_id, model, content, file_path, version],
-        ).fetchone()
-        return row[0]
+        return self._insert_artifact(
+            task_id, content, prompt_id, model, file_path, version, 0, True
+        )
+
+    def save_variants(
+        self, task_id: int, candidates: list[tuple[str, str | None]],
+        prompt_id: int | None = None, file_path: str | None = None, selected: int = 0,
+    ) -> list[int]:
+        """Новый раунд из нескольких кандидатов (variant 0..K-1, один selected).
+
+        candidates — список пар (содержимое, модель). По умолчанию выбран
+        кандидат `selected`; выбор можно поменять через :meth:`select_variant`.
+        Возвращает id записанных артефактов в порядке вариантов.
+        """
+        if not candidates:
+            return []
+        version = self._next_version(task_id)
+        return [
+            self._insert_artifact(task_id, content, prompt_id, model, file_path,
+                                  version, i, i == selected)
+            for i, (content, model) in enumerate(candidates)
+        ]
 
     def _next_version(self, task_id: int) -> int:
+        return self._latest_version(task_id) + 1
+
+    def _latest_version(self, task_id: int) -> int:
         row = self.con.execute(
             "SELECT COALESCE(MAX(version), 0) FROM artifacts WHERE task_id = ?", [task_id]
         ).fetchone()
-        return (row[0] or 0) + 1
+        return row[0] or 0
 
     def latest_artifact(self, task_id: int) -> Artifact | None:
+        """Выбранный кандидат последнего раунда — то, что идёт в сборку/контекст."""
         row = self.con.execute(
-            "SELECT id, task_id, prompt_id, model, content, file_path, version, created_at "
-            "FROM artifacts WHERE task_id = ? ORDER BY version DESC, id DESC LIMIT 1",
+            f"SELECT {_ARTIFACT_COLS} FROM artifacts WHERE task_id = ? "
+            "ORDER BY version DESC, selected DESC, variant ASC, id DESC LIMIT 1",
             [task_id],
         ).fetchone()
         return _to_artifact(row) if row else None
+
+    def list_variants(self, task_id: int, version: int | None = None) -> list[Artifact]:
+        """Все кандидаты одного раунда (по умолчанию — последнего)."""
+        if version is None:
+            version = self._latest_version(task_id)
+        if version == 0:
+            return []
+        rows = self.con.execute(
+            f"SELECT {_ARTIFACT_COLS} FROM artifacts WHERE task_id = ? AND version = ? "
+            "ORDER BY variant",
+            [task_id, version],
+        ).fetchall()
+        return [_to_artifact(r) for r in rows]
+
+    def select_variant(self, task_id: int, variant: int,
+                       version: int | None = None) -> Artifact | None:
+        """Пометить кандидата выбранным (остальные в раунде — снять). Без смены статуса.
+
+        Возвращает выбранный артефакт или None, если такого варианта в раунде нет
+        (в этом случае выбор не трогается).
+        """
+        if version is None:
+            version = self._latest_version(task_id)
+        sql = (f"SELECT {_ARTIFACT_COLS} FROM artifacts "
+               "WHERE task_id = ? AND version = ? AND variant = ?")
+        if self.con.execute(sql, [task_id, version, variant]).fetchone() is None:
+            return None
+        self.con.execute(
+            "UPDATE artifacts SET selected = (variant = ?) WHERE task_id = ? AND version = ?",
+            [variant, task_id, version],
+        )
+        return _to_artifact(self.con.execute(sql, [task_id, version, variant]).fetchone())
 
     def latest_artifacts_by_keys(self, project_id: int, keys: list[str]) -> dict[str, Artifact]:
         """Последний артефакт для каждого ключа задачи. Нужен для сборки контекста."""
@@ -216,20 +284,23 @@ class Repository:
         return result
 
     def list_artifact_versions(self, task_id: int) -> list[Artifact]:
+        """Таймлайн раундов: по одному (выбранному) кандидату на каждый раунд."""
         rows = self.con.execute(
-            "SELECT id, task_id, prompt_id, model, content, file_path, version, created_at "
-            "FROM artifacts WHERE task_id = ? ORDER BY version",
+            f"SELECT {_ARTIFACT_COLS} FROM artifacts WHERE task_id = ? AND selected = TRUE "
+            "ORDER BY version",
             [task_id],
         ).fetchall()
         return [_to_artifact(r) for r in rows]
 
     def rollback_artifact(self, task_id: int, version: int) -> Artifact | None:
-        """Делает содержимое старой версии новой (последней) версией.
+        """Делает содержимое старого раунда новым (последним) раундом.
 
-        Пункт переводится в approved — выбранную версию можно сразу собрать.
+        Берётся выбранный кандидат указанного раунда. Пункт переводится
+        в approved — версию можно сразу собрать.
         """
         row = self.con.execute(
-            "SELECT content, file_path, model FROM artifacts WHERE task_id = ? AND version = ?",
+            "SELECT content, file_path, model FROM artifacts "
+            "WHERE task_id = ? AND version = ? ORDER BY selected DESC, variant ASC LIMIT 1",
             [task_id, version],
         ).fetchone()
         if not row:

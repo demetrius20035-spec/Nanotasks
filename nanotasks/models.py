@@ -88,7 +88,9 @@ class Artifact:
     prompt_id: int | None = None
     model: str | None = None
     file_path: str | None = None
-    version: int = 1
+    version: int = 1             # номер раунда генерации (доводка)
+    variant: int = 0             # индекс кандидата внутри раунда
+    selected: bool = True        # выбранный кандидат раунда («текущий»)
     id: int | None = None
     created_at: str | None = None
 

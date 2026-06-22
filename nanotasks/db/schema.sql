@@ -45,7 +45,9 @@ CREATE TABLE IF NOT EXISTS prompts (
     created_at  TIMESTAMP DEFAULT now()
 );
 
--- Артефакты версионируются: каждый прогон пункта пишет новую version.
+-- Артефакты версионируются: каждый раунд генерации пишет новую version.
+-- Внутри раунда может быть несколько вариантов-кандидатов (variant 0..K-1);
+-- ровно один из них помечен selected — он и считается «текущим».
 CREATE TABLE IF NOT EXISTS artifacts (
     id          INTEGER PRIMARY KEY DEFAULT nextval('seq_artifacts'),
     task_id     INTEGER NOT NULL,
@@ -53,9 +55,14 @@ CREATE TABLE IF NOT EXISTS artifacts (
     model       VARCHAR,
     content     VARCHAR NOT NULL,
     file_path   VARCHAR,
-    version     INTEGER DEFAULT 1,
+    version     INTEGER DEFAULT 1,        -- номер раунда генерации (доводка)
+    variant     INTEGER DEFAULT 0,        -- индекс кандидата внутри раунда
+    selected    BOOLEAN DEFAULT TRUE,     -- выбранный кандидат раунда
     created_at  TIMESTAMP DEFAULT now()
 );
+-- Миграция БД, созданных до ветвления вариантов, делается в Database._migrate
+-- (однократным ALTER только при отсутствии колонок): ADD COLUMN IF NOT EXISTS
+-- в DuckDB сбрасывает значения к DEFAULT, поэтому повторять его на каждом старте нельзя.
 
 -- Замечания к пункту: учитываются при следующей (пере)генерации.
 CREATE TABLE IF NOT EXISTS feedback (

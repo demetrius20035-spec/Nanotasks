@@ -5,6 +5,8 @@
     python -m nanotasks projects
     python -m nanotasks run 1            # с ревью на каждом пункте
     python -m nanotasks run 1 --auto     # без ревью
+    python -m nanotasks branch 1 2.1 -n 3 --judge   # 3 кандидата + выбор судьёй
+    python -m nanotasks select 1 2.1 2   # выбрать вариант №2 и одобрить пункт
     python -m nanotasks assemble 1
     python -m nanotasks gui              # десктоп-интерфейс
 """
@@ -22,6 +24,7 @@ from .config import Config
 from .db import Database, Repository
 from .importer import import_todo, import_todo_data
 from .llm import LLMError, build_client
+from .models import TaskStatus
 from .pipeline import (
     Orchestrator, ReviewDecision, assemble, format_errors, render_tree,
     run_architect, run_verification,
@@ -269,6 +272,80 @@ def cmd_rollback(args) -> None:
         db.close()
 
 
+def _print_variants(variants) -> None:
+    for v in variants:
+        mark = "✓" if v.selected else " "
+        first = v.content.strip().splitlines()[0] if v.content.strip() else "(пусто)"
+        print(f"  [{mark}] вариант {v.variant}  {v.model}  "
+              f"({len(v.content)} симв.)  {first[:60]}")
+
+
+def cmd_branch(args) -> None:
+    """Сгенерировать несколько кандидатов на один пункт; опц. выбрать судьёй."""
+    config, db, repo = _open(args.config)
+    try:
+        task = repo.get_task_by_key(args.project_id, args.key)
+        if task is None:
+            print(f"Пункт {args.key} не найден.")
+            return
+        if not task.is_leaf:
+            print(f"Пункт {args.key} — группа, артефакт не генерируется.")
+            return
+        proj = repo.get_project(args.project_id)
+        n = args.variants if args.variants else max(2, config.variants)
+        pb = build_client(config.model("prompt_builder"), "prompt_builder")
+        cd = build_client(config.model("coder"), "coder")
+        judge = None
+        if args.judge:
+            role = "judge" if "judge" in config.models else "auditor"
+            judge = build_client(config.model(role), role)
+
+        suffix = f", судья {judge.model}" if judge else ""
+        print(f"Ветвление [{task.key}] {task.title}: {n} вар. ({cd.model}){suffix}…")
+        orch = Orchestrator(repo, config, pb, cd)
+        variants = orch.branch_task(task, proj.language, n, judge_client=judge)
+        _print_variants(variants)
+        print(f"\nВыбрать: python -m nanotasks select {args.project_id} {task.key} <variant>")
+    finally:
+        db.close()
+
+
+def cmd_variants(args) -> None:
+    config, db, repo = _open(args.config)
+    try:
+        task = repo.get_task_by_key(args.project_id, args.key)
+        if task is None:
+            print(f"Пункт {args.key} не найден.")
+            return
+        variants = repo.list_variants(task.id)
+        if not variants:
+            print(f"У пункта {args.key} ещё нет артефактов.")
+            return
+        print(f"Пункт [{task.key}] {task.title} — кандидатов в последнем раунде: {len(variants)}")
+        _print_variants(variants)
+    finally:
+        db.close()
+
+
+def cmd_select(args) -> None:
+    config, db, repo = _open(args.config)
+    try:
+        task = repo.get_task_by_key(args.project_id, args.key)
+        if task is None:
+            print(f"Пункт {args.key} не найден.")
+            return
+        art = repo.select_variant(task.id, args.variant)
+        if art is None:
+            print(f"У пункта {args.key} нет варианта {args.variant} в последнем раунде.")
+            return
+        repo.resolve_feedback(task.id)
+        repo.update_task_status(task.id, TaskStatus.APPROVED)
+        print(f"Выбран вариант {args.variant} пункта [{task.key}] → approved "
+              f"({len(art.content)} симв.).")
+    finally:
+        db.close()
+
+
 def cmd_export(args) -> None:
     config, db, repo = _open(args.config)
     try:
@@ -350,6 +427,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("key", help="ключ пункта, напр. 2.1")
     p.add_argument("version", type=int, help="номер версии")
     p.set_defaults(func=cmd_rollback)
+
+    p = sub.add_parser("branch", parents=[common], help="несколько вариантов пункта → выбор")
+    p.add_argument("project_id", type=int)
+    p.add_argument("key", help="ключ пункта, напр. 2.1")
+    p.add_argument("-n", "--variants", type=int, help="сколько кандидатов (по умолчанию ≥2)")
+    p.add_argument("--judge", action="store_true", help="дать большой модели выбрать лучший")
+    p.set_defaults(func=cmd_branch)
+
+    p = sub.add_parser("variants", parents=[common], help="кандидаты последнего раунда пункта")
+    p.add_argument("project_id", type=int)
+    p.add_argument("key", help="ключ пункта, напр. 2.1")
+    p.set_defaults(func=cmd_variants)
+
+    p = sub.add_parser("select", parents=[common], help="выбрать вариант пункта и одобрить")
+    p.add_argument("project_id", type=int)
+    p.add_argument("key", help="ключ пункта, напр. 2.1")
+    p.add_argument("variant", type=int, help="индекс варианта (с 0)")
+    p.set_defaults(func=cmd_select)
 
     p = sub.add_parser("export", parents=[common], help="собрать и упаковать проект в zip")
     p.add_argument("project_id", type=int)

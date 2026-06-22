@@ -3,7 +3,9 @@
 from .architect import parse_plan, run_architect
 from .assembler import assemble, render_tree
 from .auditor import apply_audit, build_audit_input, parse_audit, run_audit
+from .coder import generate_code, generate_variants, variant_temperatures
 from .context import assemble_context
+from .judge import parse_choice, select_best
 from .orchestrator import Orchestrator, ReviewDecision
 from .verify import VerifyResult, format_errors, run_verification
 
@@ -12,5 +14,7 @@ __all__ = [
     "assemble", "render_tree", "assemble_context",
     "run_architect", "parse_plan",
     "run_audit", "apply_audit", "parse_audit", "build_audit_input",
+    "generate_code", "generate_variants", "variant_temperatures",
+    "select_best", "parse_choice",
     "run_verification", "format_errors", "VerifyResult",
 ]
