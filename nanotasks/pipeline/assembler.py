@@ -24,6 +24,7 @@ def assemble(repo: Repository, project_id: int, output_dir: str) -> tuple[Path, 
         raise ValueError(f"Проект {project_id} не найден.")
 
     base = Path(output_dir) / _safe_name(project.name)
+    base.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
     for task in repo.list_leaf_tasks(project_id):
         if task.status not in DONE_STATES or not task.file_path:

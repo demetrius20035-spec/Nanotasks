@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from .config import Config
 from .db import Database, Repository
 from .importer import import_todo
 from .llm import LLMError, build_client
-from .pipeline import Orchestrator, ReviewDecision, assemble, render_tree
+from .pipeline import (
+    Orchestrator, ReviewDecision, assemble, format_errors, render_tree, run_verification,
+)
 
 
 def _open(config_path: str | None):
@@ -78,6 +81,9 @@ def _make_cli_review(repo: Repository):
             if ans in ("a", "approve", ""):
                 return ReviewDecision.APPROVE
             if ans in ("r", "regen", "regenerate"):
+                note = input("Что исправить? (Enter — без замечаний): ").strip()
+                if note:
+                    repo.add_feedback(task.id, note, source="human")
                 return ReviewDecision.REGENERATE
             if ans in ("s", "skip"):
                 return ReviewDecision.SKIP
@@ -126,6 +132,99 @@ def cmd_assemble(args) -> None:
         db.close()
 
 
+def cmd_verify(args) -> None:
+    config, db, repo = _open(args.config)
+    try:
+        base, _ = assemble(repo, args.project_id, config.output_dir)
+        if not config.verify_commands:
+            print("В конфиге пусто verify.commands — нечего запускать.")
+            return
+        for r in run_verification(config.verify_commands, base):
+            mark = "OK  " if r.ok else f"FAIL({r.exit_code})"
+            print(f"[{mark}] {r.command}")
+            if not r.ok and r.output:
+                print(r.output)
+    finally:
+        db.close()
+
+
+def cmd_audit(args) -> None:
+    config, db, repo = _open(args.config)
+    try:
+        base, _ = assemble(repo, args.project_id, config.output_dir)
+        errors = ""
+        if args.errors_file:
+            errors = Path(args.errors_file).read_text(encoding="utf-8")
+        elif not args.no_verify and config.verify_commands:
+            errors = format_errors(run_verification(config.verify_commands, base))
+            if errors:
+                print("Ошибки верификации переданы аудитору:\n" + errors + "\n")
+
+        auditor = build_client(config.model("auditor"), "auditor")
+        orch = Orchestrator(repo, config)
+        audit_id, parsed, n_fix, n_add = orch.audit_round(
+            args.project_id, auditor, errors or None
+        )
+        print(f"\n=== Аудит #{audit_id} ===\n{parsed.get('audit', '')}")
+        print(f"\nПравок существующих пунктов: {n_fix}; новых пунктов: {n_add}")
+        if n_fix or n_add:
+            print(f"Перегенерация: python -m nanotasks run {args.project_id}")
+    finally:
+        db.close()
+
+
+def cmd_iterate(args) -> None:
+    """Автономный цикл: прогон → сборка → верификация → аудит → повтор."""
+    config, db, repo = _open(args.config)
+    try:
+        pb = build_client(config.model("prompt_builder"), "prompt_builder")
+        cd = build_client(config.model("coder"), "coder")
+        orch = Orchestrator(repo, config, pb, cd)
+
+        def on_event(kind, task, payload):
+            if kind in ("approved", "failed", "blocked"):
+                print(f"  {kind:9} [{task.key}] {task.title}")
+
+        for rnd in range(1, args.rounds + 1):
+            print(f"\n########## Итерация {rnd}/{args.rounds} ##########")
+            orch.run(args.project_id, review=None, on_event=on_event)
+            base, written = assemble(repo, args.project_id, config.output_dir)
+            print(f"Собрано {len(written)} файлов → {base}")
+
+            if not config.verify_commands:
+                print("verify.commands пуст — проверять нечем, останов.")
+                break
+            errors = format_errors(run_verification(config.verify_commands, base))
+            if not errors:
+                print("✓ Верификация чистая — проект собирается. Останов.")
+                break
+
+            print("Есть ошибки — запускаю аудит…")
+            auditor = build_client(config.model("auditor"), "auditor")
+            audit_id, _parsed, n_fix, n_add = orch.audit_round(args.project_id, auditor, errors)
+            print(f"Аудит #{audit_id}: правок {n_fix}, новых пунктов {n_add}")
+            if n_fix == 0 and n_add == 0:
+                print("Аудит не дал правок — останов.")
+                break
+    finally:
+        db.close()
+
+
+def cmd_versions(args) -> None:
+    config, db, repo = _open(args.config)
+    try:
+        task = repo.get_task_by_key(args.project_id, args.key)
+        if task is None:
+            print(f"Пункт {args.key} не найден.")
+            return
+        versions = repo.list_artifact_versions(task.id)
+        print(f"Пункт [{task.key}] {task.title} — версий: {len(versions)}")
+        for a in versions:
+            print(f"  v{a.version}  {a.created_at}  {a.model}  ({len(a.content)} симв.)")
+    finally:
+        db.close()
+
+
 def cmd_delete(args) -> None:
     config, db, repo = _open(args.config)
     try:
@@ -165,6 +264,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("project_id", type=int)
     p.set_defaults(func=cmd_assemble)
 
+    p = sub.add_parser("verify", parents=[common], help="собрать и прогнать verify.commands")
+    p.add_argument("project_id", type=int)
+    p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("audit", parents=[common], help="аудит большой моделью → правки + новые пункты")
+    p.add_argument("project_id", type=int)
+    p.add_argument("--errors-file", help="файл с текстом ошибок вместо авто-верификации")
+    p.add_argument("--no-verify", action="store_true", help="не запускать verify.commands")
+    p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser("iterate", parents=[common], help="авто-цикл: прогон → сборка → верификация → аудит")
+    p.add_argument("project_id", type=int)
+    p.add_argument("--rounds", type=int, default=3, help="максимум волн (по умолчанию 3)")
+    p.set_defaults(func=cmd_iterate)
+
+    p = sub.add_parser("versions", parents=[common], help="версии артефакта пункта")
+    p.add_argument("project_id", type=int)
+    p.add_argument("key", help="ключ пункта, напр. 2.1")
+    p.set_defaults(func=cmd_versions)
+
     p = sub.add_parser("delete", parents=[common], help="удалить проект из БД")
     p.add_argument("project_id", type=int)
     p.set_defaults(func=cmd_delete)
@@ -180,9 +299,15 @@ def main(argv=None) -> int:
     except FileNotFoundError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 2
+    except KeyError as exc:
+        print(f"Конфигурация: {exc}", file=sys.stderr)
+        return 2
     except LLMError as exc:
         print(f"Модель недоступна: {exc}", file=sys.stderr)
         return 3
+    except ValueError as exc:
+        print(f"Ошибка данных: {exc}", file=sys.stderr)
+        return 4
     except KeyboardInterrupt:
         print("\nПрервано.", file=sys.stderr)
         return 130

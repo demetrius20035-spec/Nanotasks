@@ -16,6 +16,7 @@ from ..config import Config
 from ..db import Repository
 from ..llm import LLMClient, LLMError
 from ..models import DONE_STATES, Artifact, Task, TaskStatus
+from .auditor import apply_audit, run_audit
 from .coder import generate_code
 from .context import assemble_context
 from .prompt_builder import build_nano_prompt
@@ -35,7 +36,8 @@ StopFn = Callable[[], bool]
 
 class Orchestrator:
     def __init__(self, repo: Repository, config: Config,
-                 prompt_client: LLMClient, coder_client: LLMClient):
+                 prompt_client: LLMClient | None = None,
+                 coder_client: LLMClient | None = None):
         self.repo = repo
         self.config = config
         self.prompt_client = prompt_client
@@ -44,7 +46,14 @@ class Orchestrator:
     # ── один пункт целиком: нано-промпт → код ────────────────────────────────
     def process_task(self, task: Task, language: str) -> Artifact:
         context = assemble_context(self.repo, task)
-        nano = build_nano_prompt(self.prompt_client, task, context, language)
+        # незакрытые замечания (от человека/аудита) + текущий код → исправление
+        feedback = [f.content for f in self.repo.unresolved_feedback(task.id)]
+        current = self.repo.latest_artifact(task.id)
+        current_code = current.content if (current is not None and feedback) else None
+
+        nano = build_nano_prompt(
+            self.prompt_client, task, context, language, current_code, feedback
+        )
         prompt_id = self.repo.save_prompt(
             task.id, "prompt_builder", nano, self.prompt_client.model
         )
@@ -63,6 +72,26 @@ class Orchestrator:
             if dep is not None and dep.status not in DONE_STATES:
                 return False
         return True
+
+    def _approve(self, task: Task) -> None:
+        # одобрение закрывает все замечания: они учтены в принятой версии
+        self.repo.resolve_feedback(task.id)
+        self.repo.update_task_status(task.id, TaskStatus.APPROVED)
+
+    # ── волна аудита большой моделью ──────────────────────────────────────────
+    def audit_round(self, project_id: int, auditor_client,
+                    errors: str | None = None) -> tuple[int, dict, int, int]:
+        """Аудит проекта: разбор → правки (needs_fix) + новые пункты.
+
+        Возвращает (audit_id, parsed, число_правок, число_новых_пунктов).
+        После этого обычный run() перегенерирует тронутые пункты.
+        """
+        parsed = run_audit(auditor_client, self.repo, project_id, errors)
+        audit_id = self.repo.create_audit(
+            project_id, auditor_client.model, parsed.get("audit", ""), errors or ""
+        )
+        n_fix, n_add = apply_audit(self.repo, project_id, parsed, audit_id)
+        return audit_id, parsed, n_fix, n_add
 
     # ── полный прогон проекта ────────────────────────────────────────────────
     def run(self, project_id: int, *, review: ReviewFn | None = None,
@@ -107,7 +136,7 @@ class Orchestrator:
 
             # авто-режим: одобряем без участия человека
             if review is None:
-                self.repo.update_task_status(task.id, TaskStatus.APPROVED)
+                self._approve(task)
                 emit("approved", task, art)
                 continue
 
@@ -115,7 +144,7 @@ class Orchestrator:
             while True:
                 decision = review(task, art)
                 if decision == ReviewDecision.APPROVE:
-                    self.repo.update_task_status(task.id, TaskStatus.APPROVED)
+                    self._approve(task)
                     emit("approved", task, art)
                     break
                 if decision == ReviewDecision.SKIP:

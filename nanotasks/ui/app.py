@@ -11,8 +11,8 @@ import queue
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
-    QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QTextEdit,
+    QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QTextEdit,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -20,7 +20,7 @@ from ..config import Config
 from ..db import Database, Repository
 from ..importer import import_todo
 from ..llm import LLMError, build_client
-from ..pipeline import Orchestrator, ReviewDecision, assemble
+from ..pipeline import Orchestrator, ReviewDecision, assemble, format_errors, run_verification
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +71,35 @@ class RunWorker(QThread):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class AuditWorker(QThread):
+    """Волна аудита в фоне: сборка → верификация → большая модель → правки."""
+
+    log = Signal(str)
+    done = Signal(int, int, str)   # n_fix, n_add, audit_text
+    failed = Signal(str)
+
+    def __init__(self, config: Config, db: Database, project_id: int):
+        super().__init__()
+        self.config = config
+        self.db = db
+        self.project_id = project_id
+
+    def run(self) -> None:
+        try:
+            repo = Repository(self.db.cursor())
+            base, _ = assemble(repo, self.project_id, self.config.output_dir)
+            errors = ""
+            if self.config.verify_commands:
+                errors = format_errors(run_verification(self.config.verify_commands, base))
+                self.log.emit("Верификация: " + ("есть ошибки" if errors else "чисто"))
+            auditor = build_client(self.config.model("auditor"), "auditor")
+            orch = Orchestrator(repo, self.config)
+            _id, parsed, n_fix, n_add = orch.audit_round(self.project_id, auditor, errors or None)
+            self.done.emit(n_fix, n_add, parsed.get("audit", ""))
+        except (LLMError, Exception) as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Главное окно
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,6 +111,7 @@ class MainWindow(QMainWindow):
         self.repo = Repository(self.db.con)
         self.current_project_id: int | None = None
         self.worker: RunWorker | None = None
+        self.audit_worker: AuditWorker | None = None
         self._awaiting_review = False
 
         self.setWindowTitle("Nanotasks — оркестратор нано-задач")
@@ -125,7 +155,8 @@ class MainWindow(QMainWindow):
         self.prompt_view = QTextEdit()
         self.prompt_view.setReadOnly(True)
         rl.addWidget(self.prompt_view, 1)
-        rl.addWidget(QLabel("Сгенерированный код:"))
+        self.code_label = QLabel("Сгенерированный код:")
+        rl.addWidget(self.code_label)
         self.code_view = QTextEdit()
         self.code_view.setLineWrapMode(QTextEdit.NoWrap)
         rl.addWidget(self.code_view, 2)
@@ -150,13 +181,15 @@ class MainWindow(QMainWindow):
         self.btn_run = QPushButton("▶ Прогон (с ревью)")
         self.btn_auto = QPushButton("⏩ Прогон (авто)")
         self.btn_stop = QPushButton("■ Стоп")
-        self.btn_assemble = QPushButton("🗂 Собрать дерево файлов")
+        self.btn_assemble = QPushButton("🗂 Собрать")
+        self.btn_audit = QPushButton("🔍 Аудит")
         self.btn_run.clicked.connect(lambda: self._start_run(auto=False))
         self.btn_auto.clicked.connect(lambda: self._start_run(auto=True))
         self.btn_stop.clicked.connect(self._stop_run)
         self.btn_assemble.clicked.connect(self._on_assemble)
+        self.btn_audit.clicked.connect(self._start_audit)
         self.btn_stop.setEnabled(False)
-        for b in (self.btn_run, self.btn_auto, self.btn_stop, self.btn_assemble):
+        for b in (self.btn_run, self.btn_auto, self.btn_stop, self.btn_assemble, self.btn_audit):
             run_row.addWidget(b)
         root.addLayout(run_row)
 
@@ -206,6 +239,8 @@ class MainWindow(QMainWindow):
         art = self.repo.latest_artifact(task_id)
         self.prompt_view.setPlainText(prompt.content if prompt else "")
         self.code_view.setPlainText(art.content if art else "")
+        self.code_label.setText(f"Сгенерированный код (версия {art.version}):" if art
+                                else "Сгенерированный код:")
 
     # ── действия ────────────────────────────────────────────────────────────
     def _on_import(self) -> None:
@@ -252,9 +287,40 @@ class MainWindow(QMainWindow):
             self.worker.request_stop()
             self._log("■ Останавливаю после текущего пункта…")
 
+    def _start_audit(self) -> None:
+        if self.current_project_id is None:
+            return
+        if (self.worker and self.worker.isRunning()) or (
+            self.audit_worker and self.audit_worker.isRunning()
+        ):
+            return
+        self.audit_worker = AuditWorker(self.config, self.db, self.current_project_id)
+        self.audit_worker.log.connect(self._log)
+        self.audit_worker.done.connect(self._on_audit_done)
+        self.audit_worker.failed.connect(self._on_run_failed)
+        self._set_running(True)
+        self._log("🔍 Старт аудита большой моделью…")
+        self.audit_worker.start()
+
+    def _on_audit_done(self, n_fix: int, n_add: int, audit_text: str) -> None:
+        self._set_running(False)
+        self._log(f"🔍 Аудит: правок {n_fix}, новых пунктов {n_add}")
+        self._refresh_tree()
+        QMessageBox.information(
+            self, "Аудит завершён",
+            f"Правок существующих пунктов: {n_fix}\nНовых пунктов: {n_add}\n\n{audit_text}",
+        )
+
     def _decide(self, decision: ReviewDecision) -> None:
         if not (self.worker and self._awaiting_review):
             return
+        if decision == ReviewDecision.REGENERATE:
+            note, ok = QInputDialog.getMultiLineText(
+                self, "Перегенерация", "Что исправить? (можно пусто)", ""
+            )
+            sel = self.tree.selectedItems()
+            if ok and note.strip() and sel:
+                self.repo.add_feedback(sel[0].data(0, Qt.UserRole), note.strip(), source="human")
         self._awaiting_review = False
         self._enable_review(False)
         self.worker.submit_decision(decision)
@@ -296,6 +362,8 @@ class MainWindow(QMainWindow):
     def _set_running(self, running: bool) -> None:
         self.btn_run.setEnabled(not running)
         self.btn_auto.setEnabled(not running)
+        self.btn_assemble.setEnabled(not running)
+        self.btn_audit.setEnabled(not running)
         self.btn_stop.setEnabled(running)
         if not running:
             self._enable_review(False)
@@ -308,6 +376,8 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.request_stop()
             self.worker.wait(3000)
+        if self.audit_worker and self.audit_worker.isRunning():
+            self.audit_worker.wait(3000)
         self.db.close()
         super().closeEvent(event)
 

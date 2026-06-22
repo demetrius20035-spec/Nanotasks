@@ -29,6 +29,7 @@ class TaskStatus(str, Enum):
     CODE_READY = "code_ready"      # код сгенерирован, ждёт ревью человеком
     APPROVED = "approved"          # человек одобрил артефакт
     WRITTEN = "written"            # артефакт записан в дерево файлов
+    NEEDS_FIX = "needs_fix"        # переоткрыт аудитом/человеком для новой версии
     FAILED = "failed"              # ошибка генерации
     BLOCKED = "blocked"            # заблокирован незавершёнными зависимостями
     SKIPPED = "skipped"            # узел-группа или пропущенный пункт
@@ -42,6 +43,7 @@ DONE_STATES = {TaskStatus.APPROVED, TaskStatus.WRITTEN}
 class Project:
     name: str
     description: str = ""
+    spec: str = ""               # ТЗ + ФС целиком — контекст для аудитора
     language: str = "python"
     id: int | None = None
     created_at: str | None = None
@@ -87,5 +89,31 @@ class Artifact:
     model: str | None = None
     file_path: str | None = None
     version: int = 1
+    id: int | None = None
+    created_at: str | None = None
+
+
+@dataclass
+class Feedback:
+    """Замечание к пункту, которое учитывается при следующей (пере)генерации."""
+
+    task_id: int
+    content: str
+    source: str = "human"        # human | audit | build
+    audit_id: int | None = None
+    resolved: bool = False
+    id: int | None = None
+    created_at: str | None = None
+
+
+@dataclass
+class Audit:
+    """Волна аудита большой моделью."""
+
+    project_id: int
+    round: int = 1
+    model: str | None = None
+    summary: str = ""
+    errors: str = ""
     id: int | None = None
     created_at: str | None = None

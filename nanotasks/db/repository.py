@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from ..models import Artifact, Project, Prompt, Task, TaskStatus, TaskType
+from ..models import Artifact, Audit, Feedback, Project, Prompt, Task, TaskStatus, TaskType
 
 _TASK_COLS = (
     "id, project_id, parent_id, key, title, type, body, file_path, "
@@ -34,10 +34,14 @@ def _to_task(row) -> Task:
     )
 
 
+_PROJECT_COLS = "id, name, description, spec, language, created_at"
+
+
 def _to_project(row) -> Project:
     return Project(
-        id=row[0], name=row[1], description=row[2] or "", language=row[3] or "python",
-        created_at=str(row[4]) if row[4] is not None else None,
+        id=row[0], name=row[1], description=row[2] or "", spec=row[3] or "",
+        language=row[4] or "python",
+        created_at=str(row[5]) if row[5] is not None else None,
     )
 
 
@@ -56,34 +60,31 @@ class Repository:
     # ── Проекты ─────────────────────────────────────────────────────────────
     def create_project(self, project: Project) -> int:
         row = self.con.execute(
-            "INSERT INTO projects(name, description, language) VALUES (?, ?, ?) RETURNING id",
-            [project.name, project.description, project.language],
+            "INSERT INTO projects(name, description, spec, language) "
+            "VALUES (?, ?, ?, ?) RETURNING id",
+            [project.name, project.description, project.spec, project.language],
         ).fetchone()
         return row[0]
 
     def get_project(self, project_id: int) -> Project | None:
         row = self.con.execute(
-            "SELECT id, name, description, language, created_at FROM projects WHERE id = ?",
-            [project_id],
+            f"SELECT {_PROJECT_COLS} FROM projects WHERE id = ?", [project_id]
         ).fetchone()
         return _to_project(row) if row else None
 
     def list_projects(self) -> list[Project]:
         rows = self.con.execute(
-            "SELECT id, name, description, language, created_at FROM projects ORDER BY id"
+            f"SELECT {_PROJECT_COLS} FROM projects ORDER BY id"
         ).fetchall()
         return [_to_project(r) for r in rows]
 
     def delete_project(self, project_id: int) -> None:
-        self.con.execute(
-            "DELETE FROM artifacts WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)",
-            [project_id],
-        )
-        self.con.execute(
-            "DELETE FROM prompts WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)",
-            [project_id],
-        )
+        sub = "SELECT id FROM tasks WHERE project_id = ?"
+        self.con.execute(f"DELETE FROM artifacts WHERE task_id IN ({sub})", [project_id])
+        self.con.execute(f"DELETE FROM prompts WHERE task_id IN ({sub})", [project_id])
+        self.con.execute(f"DELETE FROM feedback WHERE task_id IN ({sub})", [project_id])
         self.con.execute("DELETE FROM tasks WHERE project_id = ?", [project_id])
+        self.con.execute("DELETE FROM audits WHERE project_id = ?", [project_id])
         self.con.execute("DELETE FROM events WHERE project_id = ?", [project_id])
         self.con.execute("DELETE FROM projects WHERE id = ?", [project_id])
 
@@ -208,6 +209,80 @@ class Repository:
                 if art:
                     result[key] = art
         return result
+
+    def list_artifact_versions(self, task_id: int) -> list[Artifact]:
+        rows = self.con.execute(
+            "SELECT id, task_id, prompt_id, model, content, file_path, version, created_at "
+            "FROM artifacts WHERE task_id = ? ORDER BY version",
+            [task_id],
+        ).fetchall()
+        return [_to_artifact(r) for r in rows]
+
+    def leaf_artifacts(self, project_id: int) -> list[tuple[Task, Artifact]]:
+        """Пары (лист, его последний артефакт) — для подачи всего кода аудитору."""
+        result: list[tuple[Task, Artifact]] = []
+        for task in self.list_leaf_tasks(project_id):
+            art = self.latest_artifact(task.id)
+            if art is not None:
+                result.append((task, art))
+        return result
+
+    # ── Замечания (feedback) ─────────────────────────────────────────────────
+    def add_feedback(self, task_id: int, content: str, source: str = "human",
+                     audit_id: int | None = None) -> int:
+        row = self.con.execute(
+            "INSERT INTO feedback(task_id, source, audit_id, content) "
+            "VALUES (?, ?, ?, ?) RETURNING id",
+            [task_id, source, audit_id, content],
+        ).fetchone()
+        return row[0]
+
+    def unresolved_feedback(self, task_id: int) -> list[Feedback]:
+        rows = self.con.execute(
+            "SELECT id, task_id, source, audit_id, content, resolved, created_at "
+            "FROM feedback WHERE task_id = ? AND resolved = FALSE ORDER BY id",
+            [task_id],
+        ).fetchall()
+        return [
+            Feedback(id=r[0], task_id=r[1], source=r[2], audit_id=r[3], content=r[4],
+                     resolved=bool(r[5]), created_at=str(r[6]) if r[6] is not None else None)
+            for r in rows
+        ]
+
+    def resolve_feedback(self, task_id: int) -> None:
+        self.con.execute(
+            "UPDATE feedback SET resolved = TRUE WHERE task_id = ? AND resolved = FALSE",
+            [task_id],
+        )
+
+    def reopen_task(self, task_id: int) -> None:
+        self.update_task_status(task_id, TaskStatus.NEEDS_FIX)
+
+    # ── Аудиты ────────────────────────────────────────────────────────────────
+    def create_audit(self, project_id: int, model: str | None,
+                     summary: str, errors: str = "") -> int:
+        row = self.con.execute(
+            "SELECT COALESCE(MAX(round), 0) FROM audits WHERE project_id = ?", [project_id]
+        ).fetchone()
+        next_round = (row[0] or 0) + 1
+        ins = self.con.execute(
+            "INSERT INTO audits(project_id, round, model, summary, errors) "
+            "VALUES (?, ?, ?, ?, ?) RETURNING id",
+            [project_id, next_round, model, summary, errors],
+        ).fetchone()
+        return ins[0]
+
+    def latest_audit(self, project_id: int) -> Audit | None:
+        row = self.con.execute(
+            "SELECT id, project_id, round, model, summary, errors, created_at "
+            "FROM audits WHERE project_id = ? ORDER BY round DESC LIMIT 1",
+            [project_id],
+        ).fetchone()
+        if not row:
+            return None
+        return Audit(id=row[0], project_id=row[1], round=row[2], model=row[3],
+                     summary=row[4] or "", errors=row[5] or "",
+                     created_at=str(row[6]) if row[6] is not None else None)
 
     # ── Лог событий ───────────────────────────────────────────────────────────
     def log_event(self, message: str, project_id: int | None = None,

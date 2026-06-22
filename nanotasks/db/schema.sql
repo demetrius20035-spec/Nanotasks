@@ -8,11 +8,14 @@ CREATE SEQUENCE IF NOT EXISTS seq_tasks START 1;
 CREATE SEQUENCE IF NOT EXISTS seq_prompts START 1;
 CREATE SEQUENCE IF NOT EXISTS seq_artifacts START 1;
 CREATE SEQUENCE IF NOT EXISTS seq_events START 1;
+CREATE SEQUENCE IF NOT EXISTS seq_feedback START 1;
+CREATE SEQUENCE IF NOT EXISTS seq_audits START 1;
 
 CREATE TABLE IF NOT EXISTS projects (
     id          INTEGER PRIMARY KEY DEFAULT nextval('seq_projects'),
     name        VARCHAR NOT NULL,
     description VARCHAR DEFAULT '',
+    spec        VARCHAR DEFAULT '',     -- ТЗ + ФС целиком (для аудитора)
     language    VARCHAR DEFAULT 'python',
     created_at  TIMESTAMP DEFAULT now()
 );
@@ -42,6 +45,7 @@ CREATE TABLE IF NOT EXISTS prompts (
     created_at  TIMESTAMP DEFAULT now()
 );
 
+-- Артефакты версионируются: каждый прогон пункта пишет новую version.
 CREATE TABLE IF NOT EXISTS artifacts (
     id          INTEGER PRIMARY KEY DEFAULT nextval('seq_artifacts'),
     task_id     INTEGER NOT NULL,
@@ -50,6 +54,28 @@ CREATE TABLE IF NOT EXISTS artifacts (
     content     VARCHAR NOT NULL,
     file_path   VARCHAR,
     version     INTEGER DEFAULT 1,
+    created_at  TIMESTAMP DEFAULT now()
+);
+
+-- Замечания к пункту: учитываются при следующей (пере)генерации.
+CREATE TABLE IF NOT EXISTS feedback (
+    id          INTEGER PRIMARY KEY DEFAULT nextval('seq_feedback'),
+    task_id     INTEGER NOT NULL,
+    source      VARCHAR DEFAULT 'human',  -- human | audit | build
+    audit_id    INTEGER,
+    content     VARCHAR NOT NULL,
+    resolved    BOOLEAN DEFAULT FALSE,
+    created_at  TIMESTAMP DEFAULT now()
+);
+
+-- Волна аудита большой моделью.
+CREATE TABLE IF NOT EXISTS audits (
+    id          INTEGER PRIMARY KEY DEFAULT nextval('seq_audits'),
+    project_id  INTEGER NOT NULL,
+    round       INTEGER DEFAULT 1,
+    model       VARCHAR,
+    summary     VARCHAR,                  -- текст аудита
+    errors      VARCHAR,                  -- захваченные ошибки сборки/запуска
     created_at  TIMESTAMP DEFAULT now()
 );
 
@@ -66,3 +92,5 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_prompts_task ON prompts(task_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_task ON feedback(task_id);
+CREATE INDEX IF NOT EXISTS idx_audits_project ON audits(project_id);

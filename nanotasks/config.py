@@ -30,6 +30,7 @@ class Config:
     models: dict[str, ModelConfig] = field(default_factory=dict)
     run_mode: str = "review"   # review | auto
     max_retries: int = 1
+    verify_commands: list[str] = field(default_factory=list)  # компиляция/запуск/тесты
     source_path: str | None = None
 
     @classmethod
@@ -56,12 +57,14 @@ class Config:
             )
 
         run = data.get("run") or {}
+        verify = data.get("verify") or {}
         return cls(
             database_path=(data.get("database") or {}).get("path", "data/nanotasks.duckdb"),
             output_dir=(data.get("output") or {}).get("dir", "output"),
             models=models,
             run_mode=run.get("mode", "review"),
             max_retries=int(run.get("max_retries", 1)),
+            verify_commands=list(verify.get("commands") or []),
             source_path=cfg_path,
         )
 

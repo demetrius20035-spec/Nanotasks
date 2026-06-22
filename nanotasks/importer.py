@@ -32,6 +32,7 @@ def import_todo(repo: Repository, path: str) -> int:
         Project(
             name=proj["name"],
             description=proj.get("description", "") or "",
+            spec=(proj.get("spec") or "").strip(),
             language=proj.get("language", "python") or "python",
         )
     )

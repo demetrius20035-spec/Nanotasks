@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Nanotasks — пример конфигурации.
-# Скопируй в config/config.yaml и поправь под себя.
+# Скопируй в config/config.yaml и поправь под себя:
 #   cp config/config.example.yaml config/config.yaml
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -14,45 +14,81 @@ output:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Роли моделей. Каждая роль — отдельный клиент со своим endpoint и моделью.
-# Локальные модели Ollama/LM Studio говорят по OpenAI-совместимому протоколу.
-#   Ollama:    base_url: http://localhost:11434/v1
-#   LM Studio: base_url: http://localhost:1234/v1
+#
+# Провайдеры:
+#   openai_compatible — Ollama (base_url: http://localhost:11434/v1),
+#                       LM Studio (http://localhost:1234/v1),
+#                       OpenRouter (https://openrouter.ai/api/v1),
+#                       VseGPT     (https://api.vsegpt.ru/v1),
+#                       BotHub     (https://bothub.chat/api/v2/openai/v1)
+#                       — всем нужен только base_url + api_key + model.
+#   yandex (alias alice) — Алиса / YandexGPT 5.1 Pro (через openai SDK).
+#   gigachat             — Сбер GigaChat-2 / -2-Pro / -2-Max.
 # ─────────────────────────────────────────────────────────────────────────────
 models:
-
-  # АРХИТЕКТОР — большая внешняя модель. Делает ТЗ+ФС+TODO.
-  # Пока не вызывается оркестратором (TODO импортируем вручную),
-  # но место под API уже зарезервировано. Провайдеры: openai_compatible | alice | gigachat.
-  architect:
-    provider: openai_compatible
-    base_url: http://localhost:11434/v1
-    model: qwen2.5:32b
-    api_key: null
-    temperature: 0.3
-    timeout: 600
 
   # ПРОМПТ-МЕЙКЕР — локальная модель. Из пункта TODO делает точный нано-промпт.
   prompt_builder:
     provider: openai_compatible
     base_url: http://localhost:11434/v1
     model: gemma2:27b
-    api_key: null
     temperature: 0.2
     timeout: 600
 
-  # КОДЕР — локальная модель. Из нано-промпта делает код/артефакт.
+  # КОДЕР — локальная модель. Из нано-промпта делает код.
   coder:
     provider: openai_compatible
-    base_url: http://localhost:11434/v1
+    base_url: http://localhost:1234/v1
     model: qwen2.5-coder:14b
-    api_key: null
     temperature: 0.1
     timeout: 600
 
+  # АУДИТОР — большая модель. Видит весь код + ошибки → правки и новые пункты.
+  auditor:
+    provider: openai_compatible
+    base_url: http://localhost:11434/v1
+    model: qwen2.5:32b
+    temperature: 0.3
+    timeout: 900
+
+  # АРХИТЕКТОР — большая модель (ТЗ→ФС→TODO). Пока вызывается вручную.
+  architect:
+    provider: openai_compatible
+    base_url: http://localhost:11434/v1
+    model: qwen2.5:32b
+    temperature: 0.3
+    timeout: 900
+
+  # ── Примеры внешних провайдеров (раскомментируй и подставь ключи) ──
+  #
+  # auditor:
+  #   provider: yandex            # alias: alice
+  #   model: yandexgpt-5.1/latest # или aliceai-llm/latest
+  #   api_key: <API-ключ>
+  #   folder_id: b1g................
+  #   max_tokens: 4000
+  #
+  # auditor:
+  #   provider: gigachat
+  #   model: GigaChat-2-Max       # GigaChat-2 | GigaChat-2-Pro | GigaChat-2-Max
+  #   api_key: <Authorization key (Basic TOKEN)>
+  #   scope: GIGACHAT_API_PERS
+  #   verify_ssl: false           # часто нужно из-за российского УЦ
+  #
+  # coder:
+  #   provider: openai_compatible
+  #   base_url: https://openrouter.ai/api/v1
+  #   api_key: <ключ OpenRouter>
+  #   model: qwen/qwen-2.5-coder-32b-instruct
+
 # Поведение цикла исполнения.
 run:
-  # auto  — гнать пункты подряд без остановки;
-  # review — останавливаться на каждом сгенерированном артефакте для ревью человеком.
-  mode: review
-  # Сколько раз пытаться перегенерировать пункт при ошибке модели.
+  mode: review        # review — пауза на каждом артефакте; auto — без пауз
   max_retries: 1
+
+# Верификация собранного проекта. Команды выполняются в каталоге output/<проект>.
+# Их ошибки уходят аудитору. Пример для Python — компиляция всех модулей:
+verify:
+  commands:
+    - "python -m compileall -q ."
+    # - "pytest -q"
